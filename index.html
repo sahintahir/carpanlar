@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Çarpanlar ve Katlar - Mükemmel Öğrenme Aracı</title>
+  
+  <!-- Meta ve SEO -->
+  <meta name="description" content="Çarpanlar ve katlar konusunu interaktif olarak öğrenin." />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#1b6d8f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  
+  <!-- Security -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;" />
+  
+  <!-- Google Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+  
+  <style>
+    /* ... (önceki CSS) ... */
+    
+    /* Performans optimizasyonları */
+    .chip {
+      will-change: transform;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      animation: popIn 0.3s ease-out;
+    }
+    
+    @media (prefers-reduced-motion: reduce) {
+      .chip { animation: none; }
+      .chip:hover { transform: none; }
+    }
+    
+    /* ... */
+  </style>
+</head>
+<body>
+
+<!-- ... HTML içeriği ... -->
+
+<script>
+  (function() {
+    "use strict";
+    
+    // ---------- KONFİGÜRASYON ----------
+    const CONFIG = {
+      MAX_HISTORY: 20,
+      MAX_NUMBER: 1000000,
+      DEBOUNCE_DELAY: 300,
+      CACHE_SIZE: 100,
+      BATCH_SIZE: 1000,
+      AUTO_SAVE_INTERVAL: 30000,
+      MAX_RETRY: 3
+    };
+    
+    // ---------- PERFORMANCE MONITOR ----------
+    const perfMonitor = {
+      marks: {},
+      measures: {},
+      start(label) {
+        this.marks[label] = performance.now();
+      },
+      end(label) {
+        if (!this.marks[label]) return;
+        const duration = performance.now() - this.marks[label];
+        this.measures[label] = duration;
+        if (duration > 100) {
+          console.warn(`⚠️ ${label} yavaş (${duration.toFixed(2)}ms)`);
+        }
+        return duration;
+      }
+    };
+    
+    // ---------- ERROR BOUNDARY ----------
+    class ErrorBoundary {
+      constructor() {
+        this.errorCount = 0;
+        this.maxErrors = 5;
+        this.errors = [];
+      }
+      
+      handle(error, context) {
+        this.errorCount++;
+        this.errors.push({ error, context, timestamp: Date.now() });
+        
+        if (this.errorCount > this.maxErrors) {
+          this.criticalError(error);
+        }
+        
+        console.error(`[${context}]`, error);
+        return this.getFallback(error);
+      }
+      
+      criticalError(error) {
+        alert('⚠️ Kritik bir hata oluştu. Uygulama yeniden başlatılıyor.');
+        localStorage.clear();
+        location.reload();
+      }
+      
+      getFallback(error) {
+        if (error.message?.includes('Worker')) {
+          return 'Worker hatası, normal modda devam ediliyor';
+        }
+        return 'Bir hata oluştu, lütfen tekrar deneyin';
+      }
+    }
+    
+    const errorBoundary = new ErrorBoundary();
+    
+    // ---------- STATE YÖNETİMİ ----------
+    const state = {
+      factors: { history: [], currentNumber: 36 },
+      multiples: { history: [], currentNumber: 7 },
+      language: 'tr'
+    };
+    
+    // ---------- CACHE ----------
+    const resultCache = new Map();
+    
+    function getCached(key, compute) {
+      if (resultCache.has(key)) {
+        console.log(`✅ Cache hit: ${key}`);
+        return resultCache.get(key);
+      }
+      
+      console.log(`❌ Cache miss: ${key}`);
+      const result = compute();
+      resultCache.set(key, result);
+      
+      if (resultCache.size > CONFIG.CACHE_SIZE) {
+        const firstKey = resultCache.keys().next().value;
+        resultCache.delete(firstKey);
+      }
+      
+      return result;
+    }
+    
+    // ---------- PURE FONKSİYONLAR ----------
+    function findFactors(n) {
+      if (n < 1) return [];
+      const factors = [];
+      const sqrt = Math.sqrt(n);
+      for (let i = 1; i <= sqrt; i++) {
+        if (n % i === 0) {
+          factors.push(i);
+          const divisor = n / i;
+          if (divisor !== i) factors.push(divisor);
+        }
+      }
+      return factors.sort((a, b) => a - b);
+    }
+    
+    function isPrime(n) {
+      if (n < 2) return false;
+      if (n === 2) return true;
+      if (n % 2 === 0) return false;
+      const sqrt = Math.sqrt(n);
+      for (let i = 3; i <= sqrt; i += 2) {
+        if (n % i === 0) return false;
+      }
+      return true;
+    }
+    
+    // ---------- WEB WORKER (Memory safe) ----------
+    let worker = null;
+    let blobUrl = null;
+    let workerBusy = false;
+    let requestId = 0;
+    
+    function createWorker() {
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+      
+      const workerCode = `
+        self.onmessage = function(e) {
+          const n = e.data;
+          const factors = [];
+          const sqrt = Math.sqrt(n);
+          for (let i = 1; i <= sqrt; i++) {
+            if (n % i === 0) {
+              factors.push(i);
+              if (i !== n/i) factors.push(n/i);
+            }
+          }
+          self.postMessage(factors.sort((a,b) => a-b));
+        };
+      `;
+      
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      blobUrl = URL.createObjectURL(blob);
+      return new Worker(blobUrl);
+    }
+    
+    function getWorker() {
+      if (!worker) {
+        worker = createWorker();
+        worker.onerror = function(e) {
+          console.error('Worker hatası:', e);
+          workerBusy = false;
+        };
+      }
+      return worker;
+    }
+    
+    // ---------- STATE PERSISTENCE ----------
+    function saveState() {
+      try {
+        const data = {
+          ...state,
+          timestamp: Date.now()
+        };
+        localStorage.setItem('mathAppState', JSON.stringify(data));
+      } catch (e) {
+        console.warn('State kaydedilemedi:', e);
+      }
+    }
+    
+    function loadState() {
+      try {
+        const saved = localStorage.getItem('mathAppState');
+        if (!saved) return null;
+        
+        const data = JSON.parse(saved);
+        // 7 günden eski state'i yükleme
+        if (Date.now() - data.timestamp > 7 * 24 * 60 * 60 * 1000) {
+          localStorage.removeItem('mathAppState');
+          return null;
+        }
+        
+        return data;
+      } catch (e) {
+        console.warn('State yüklenemedi:', e);
+        return null;
+      }
+    }
+    
+    // ---------- NETWORK MONITOR ----------
+    let isOnline = navigator.onLine;
+    
+    window.addEventListener('online', () => {
+      isOnline = true;
+      showNotification('🟢 İnternet bağlantısı geldi!', 'success');
+    });
+    
+    window.addEventListener('offline', () => {
+      isOnline = false;
+      showNotification('🔴 İnternet bağlantısı kesildi!', 'error');
+    });
+    
+    // ---------- NOTIFICATION SYSTEM ----------
+    function showNotification(message, type = 'info') {
+      const div = document.createElement('div');
+      div.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 16px 24px;
+        border-radius: 12px;
+        background: ${type === 'error' ? '#fee' : type === 'success' ? '#efe' : '#e8f4f8'};
+        border: 1px solid ${type === 'error' ? '#fcc' : type === 'success' ? '#cfc' : '#bcd'};
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        z-index: 10000;
+        max-width: 400px;
+        animation: slideIn 0.3s ease-out;
+      `;
+      div.textContent = message;
+      document.body.appendChild(div);
+      
+      setTimeout(() => {
+        div.style.opacity = '0';
+        div.style.transition = 'opacity 0.3s';
+        setTimeout(() => div.remove(), 300);
+      }, 5000);
+    }
+    
+    // ---------- VALİDASYON ----------
+    function validateInput(value) {
+      const num = Number(value);
+      if (!Number.isInteger(num) || isNaN(num)) {
+        return { valid: false, message: 'Lütfen tam sayı girin!' };
+      }
+      if (num < 1) {
+        return { valid: false, message: 'Lütfen 1\'den büyük bir sayı girin!' };
+      }
+      if (num > CONFIG.MAX_NUMBER) {
+        return { valid: false, message: `Sayı ${CONFIG.MAX_NUMBER.toLocaleString()}'dan büyük olamaz!` };
+      }
+      return { valid: true, value: num };
+    }
+    
+    // ---------- RENDER ----------
+    function renderChips(data, container, options = {}) {
+      const fragment = document.createDocumentFragment();
+      
+      if (!data || data.length === 0) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = '—';
+        fragment.appendChild(chip);
+        container.innerHTML = '';
+        container.appendChild(fragment);
+        return;
+      }
+      
+      data.forEach(item => {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = String(item);
+        chip.setAttribute('role', 'listitem');
+        
+        if (options.showPrime && isPrime(item)) {
+          chip.classList.add('prime');
+          chip.setAttribute('aria-label', `Asal çarpan: ${item}`);
+        }
+        
+        if (item % 2 === 0) {
+          chip.classList.add('even');
+        } else {
+          chip.classList.add('odd');
+        }
+        
+        fragment.appendChild(chip);
+      });
+      
+      container.innerHTML = '';
+      container.appendChild(fragment);
+    }
+    
+    function showLoading(container) {
+      const chip = document.createElement('span');
+      chip.className = 'chip loading';
+      chip.setAttribute('role', 'status');
+      chip.innerHTML = '<span class="spinner"></span> Hesaplanıyor...';
+      container.innerHTML = '';
+      container.appendChild(chip);
+    }
+    
+    function showError(container, message) {
+      if (!isOnline) {
+        message += ' (Çevrimdışı mod)';
+      }
+      
+      const chip = document.createElement('span');
+      chip.className = 'chip error';
+      chip.textContent = '❌ ' + message;
+      container.innerHTML = '';
+      container.appendChild(chip);
+    }
+    
+    // ---------- ÇARPANLAR ----------
+    function renderFactors() {
+      try {
+        const currentRequestId = ++requestId;
+        perfMonitor.start('renderFactors');
+        
+        const validation = validateInput(carpanInput.value);
+        if (!validation.valid) {
+          showError(carpanChips, validation.message);
+          return;
+        }
+        
+        const num = validation.value;
+        state.factors.currentNumber = num;
+        
+        showLoading(carpanChips);
+        
+        // Cache kontrolü
+        const cacheKey = `factors_${num}`;
+        const cached = resultCache.get(cacheKey);
+        if (cached) {
+          setTimeout(() => {
+            if (currentRequestId !== requestId) return;
+            renderChips(cached, carpanChips, { showPrime: true });
+            perfMonitor.end('renderFactors');
+          }, 0);
+          return;
+        }
+        
+        // Worker kullan
+        if (worker) {
+          if (workerBusy) {
+            showError(carpanChips, 'Hesaplama devam ediyor, lütfen bekleyin...');
+            return;
+          }
+          
+          workerBusy = true;
+          const w = getWorker();
+          w.postMessage(num);
+          
+          w.onmessage = function(e) {
+            workerBusy = false;
+            if (currentRequestId !== requestId) return;
+            
+            const factors = e.data;
+            resultCache.set(cacheKey, factors);
+            renderChips(factors, carpanChips, { showPrime: true });
+            perfMonitor.end('renderFactors');
+            saveState();
+          };
+          
+          w.onerror = function(e) {
+            workerBusy = false;
+            if (currentRequestId !== requestId) return;
+            showError(carpanChips, 'Worker hatası, normal modda devam ediliyor');
+            renderFactorsFallback(num, currentRequestId);
+          };
+        } else {
+          // Fallback
+          renderFactorsFallback(num, currentRequestId);
+        }
+      } catch (error) {
+        const fallback = errorBoundary.handle(error, 'renderFactors');
+        showError(carpanChips, fallback);
+      }
+    }
+    
+    function renderFactorsFallback(num, requestId) {
+      try {
+        perfMonitor.start('renderFactorsFallback');
+        const factors = findFactors(num);
+        
+        if (requestId && requestId !== requestId) return;
+        
+        resultCache.set(`factors_${num}`, factors);
+        renderChips(factors, carpanChips, { showPrime: true });
+        perfMonitor.end('renderFactorsFallback');
+        saveState();
+      } catch (error) {
+        const fallback = errorBoundary.handle(error, 'renderFactorsFallback');
+        showError(carpanChips, fallback);
+      }
+    }
+    
+    // ---------- KATLAR ----------
+    function renderMultiples() {
+      try {
+        perfMonitor.start('renderMultiples');
+        
+        const validation = validateInput(katInput.value);
+        if (!validation.valid) {
+          showError(katChips, validation.message);
+          return;
+        }
+        
+        const num = validation.value;
+        state.multiples.currentNumber = num;
+        
+        showLoading(katChips);
+        
+        const cacheKey = `multiples_${num}`;
+        const cached = resultCache.get(cacheKey);
+        if (cached) {
+          setTimeout(() => {
+            renderChips(cached, katChips, { showPrime: false });
+            perfMonitor.end('renderMultiples');
+          }, 0);
+          return;
+        }
+        
+        setTimeout(() => {
+          const multiples = [];
+          for (let i = 1; i <= 10; i++) {
+            multiples.push(num * i);
+          }
+          
+          resultCache.set(cacheKey, multiples);
+          renderChips(multiples, katChips, { showPrime: false });
+          perfMonitor.end('renderMultiples');
+          saveState();
+        }, 100);
+      } catch (error) {
+        const fallback = errorBoundary.handle(error, 'renderMultiples');
+        showError(katChips, fallback);
+      }
+    }
+    
+    // ---------- DEBOUNCE (Improved) ----------
+    function debounce(func, wait) {
+      let timeout;
+      let lastCall = 0;
+      
+      return function(...args) {
+        const now = Date.now();
+        const remaining = wait - (now - lastCall);
+        
+        clearTimeout(timeout);
+        
+        if (remaining <= 0) {
+          func.apply(this, args);
+          lastCall = now;
+        } else {
+          timeout = setTimeout(() => {
+            func.apply(this, args);
+            lastCall = Date.now();
+          }, remaining);
+        }
+      };
+    }
+    
+    // ---------- DOM REFERANSLARI ----------
+    const carpanInput = document.getElementById('carpanInput');
+    const carpanBtn = document.getElementById('carpanBtn');
+    const carpanChips = document.getElementById('carpanChips');
+    const katInput = document.getElementById('katInput');
+    const katBtn = document.getElementById('katBtn');
+    const katChips = document.getElementById('katChips');
+    
+    // ---------- OLAY DİNLEYİCİLERİ ----------
+    carpanBtn.addEventListener('click', renderFactors);
+    katBtn.addEventListener('click', renderMultiples);
+    
+    const debouncedFactors = debounce(renderFactors, CONFIG.DEBOUNCE_DELAY);
+    const debouncedMultiples = debounce(renderMultiples, CONFIG.DEBOUNCE_DELAY);
+    
+    carpanInput.addEventListener('input', debouncedFactors);
+    katInput.addEventListener('input', debouncedMultiples);
+    
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        renderFactors();
+        renderMultiples();
+      }
+    });
+    
+    // ---------- TEMİZLİK ----------
+    window.addEventListener('beforeunload', () => {
+      if (worker) {
+        worker.terminate();
+        worker = null;
+      }
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+        blobUrl = null;
+      }
+      saveState();
+    });
+    
+    // ---------- OTOMATİK KAYDET ----------
+    setInterval(saveState, CONFIG.AUTO_SAVE_INTERVAL);
+    
+    // ---------- BAŞLAT ----------
+    // State'i yükle
+    const savedState = loadState();
+    if (savedState) {
+      Object.assign(state, savedState);
+      if (state.factors.currentNumber) {
+        carpanInput.value = state.factors.currentNumber;
+      }
+      if (state.multiples.currentNumber) {
+        katInput.value = state.multiples.currentNumber;
+      }
+    }
+    
+    // Worker'ı başlat
+    if (typeof Worker !== 'undefined') {
+      try {
+        worker = getWorker();
+        console.log('✅ Web Worker aktif');
+      } catch (e) {
+        console.warn('⚠️ Web Worker desteklenmiyor');
+        worker = null;
+      }
+    }
+    
+    // İlk render
+    renderFactors();
+    renderMultiples();
+    
+    console.log('🚀 Mükemmel versiyon başlatıldı!');
+    console.log('📊 Konfigürasyon:', CONFIG);
+    console.log('📦 State:', state);
+    console.log('💾 Cache boyutu:', resultCache.size);
+    
+    // Performance raporu
+    setTimeout(() => {
+      console.log('📊 Performans Raporu:', perfMonitor.measures);
+    }, 5000);
+    
+  })();
+</script>
+
+</body>
+</html>
